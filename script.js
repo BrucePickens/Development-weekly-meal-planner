@@ -1,4 +1,8 @@
 console.log("SCRIPT LOADED");
+window.onerror = (msg, src, line, col, err) => {
+  alert("JS ERROR:\n" + msg + "\nLine: " + line);
+};
+
 /* =========================================================
    INDEXEDDB — ATTACHMENTS ONLY (ISOLATED)
 ========================================================= */
@@ -1368,58 +1372,29 @@ window.addEventListener("load", () => {
 const exportDataBtn = document.getElementById("exportDataBtn");
 const importDataBtn = document.getElementById("importDataBtn");
 const importFileInput = document.getElementById("importFileInput");
-// ===== IMPORT MAIN DATA + ATTACHMENTS =====
+
+// ===== IMPORT UNIFIED DATA + ATTACHMENTS =====
 if (importDataBtn && importFileInput) {
   importDataBtn.onclick = () => {
     importFileInput.click();
   };
 
-  importFileInput.onchange = e => {
+  importFileInput.onchange = async e => {
     const file = e.target.files[0];
     if (!file) return;
 
-    // ATTACHMENTS FILE
-    if (file.name.startsWith("meal-planner-attachments")) {
-      const reader = new FileReader();
-      reader.onload = async () => {
-        const parsed = JSON.parse(reader.result);
-        const attachments = parsed.attachments || [];
-
-const db = await openAttachmentDB();
-
-for (const a of attachments) {
-  const byteString = atob(a.data.split(",")[1]);
-  const mime = a.type;
-  const ab = new ArrayBuffer(byteString.length);
-  const ia = new Uint8Array(ab);
-
-  for (let i = 0; i < byteString.length; i++) {
-    ia[i] = byteString.charCodeAt(i);
-  }
-
-  const blob = new Blob([ab], { type: mime });
-
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction("files", "readwrite");
-    const store = tx.objectStore("files");
-    store.put(blob, a.id);
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-alert("Attachment import complete.");
-
-      };
-      reader.readAsText(file);
-      return;
-    }
-
-    // MAIN DATA FILE
     const reader = new FileReader();
-    reader.onload = () => {
-      const data = JSON.parse(reader.result);
 
+    reader.onload = async () => {
+      let data;
+      try {
+        data = JSON.parse(reader.result);
+      } catch {
+        alert("Invalid import file.");
+        return;
+      }
+
+      // ===== RESTORE MAIN DATA =====
       categories = data.categories || [];
       meals = data.meals || [];
       plan = data.plan || plan;
@@ -1428,6 +1403,35 @@ alert("Attachment import complete.");
         data.ingredientGroupOrder || ingredientGroupOrder;
 
       saveAll();
+
+      // ===== RESTORE ATTACHMENTS =====
+      if (Array.isArray(data.attachments) && data.attachments.length) {
+        const db = await openAttachmentDB();
+
+        for (const a of data.attachments) {
+          if (!a.id || !a.data || !a.type) continue;
+
+          const byteString = atob(a.data.split(",")[1]);
+          const ab = new ArrayBuffer(byteString.length);
+          const ia = new Uint8Array(ab);
+
+          for (let i = 0; i < byteString.length; i++) {
+            ia[i] = byteString.charCodeAt(i);
+          }
+
+          const blob = new Blob([ab], { type: a.type });
+
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction(ATTACHMENT_STORE, "readwrite");
+            const store = tx.objectStore(ATTACHMENT_STORE);
+            store.put(blob, a.id);
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+          });
+        }
+      }
+
+      // ===== RE-RENDER =====
       renderCategories();
       renderMeals();
       renderPlanner();
@@ -1435,17 +1439,18 @@ alert("Attachment import complete.");
       renderGroceryListPreview();
 
       alert("Import complete.");
+      importFileInput.value = "";
     };
+
     reader.readAsText(file);
   };
 }
-
 
 if (exportDataBtn) {
   exportDataBtn.onclick = async () => {
 
     /* ===============================
-       EXPORT MAIN DATA
+       UNIFIED EXPORT — SAFE CURSOR VERSION
     =============================== */
 
     const payload = {
@@ -1453,95 +1458,74 @@ if (exportDataBtn) {
       meals,
       plan,
       ingredientGroups,
-      ingredientGroupOrder
+      ingredientGroupOrder,
+      attachments: []
     };
 
-    const dataBlob = new Blob(
+    const db = await openAttachmentDB();
+
+    // 1) Collect blobs synchronously (NO async work here)
+    const blobs = [];
+
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(ATTACHMENT_STORE, "readonly");
+      const store = tx.objectStore(ATTACHMENT_STORE);
+      const req = store.openCursor();
+
+      req.onsuccess = e => {
+        const cursor = e.target.result;
+        if (!cursor) {
+          resolve();
+          return;
+        }
+
+        blobs.push({
+          id: cursor.key,
+          type: cursor.value.type,
+          blob: cursor.value
+        });
+
+        cursor.continue();
+      };
+
+      req.onerror = () => reject(req.error);
+    });
+
+    // 2) Convert blobs AFTER transaction is complete
+    for (const item of blobs) {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(item.blob);
+      });
+
+      payload.attachments.push({
+        id: item.id,
+        type: item.type,
+        data: dataUrl
+      });
+    }
+
+    // 3) Download
+    const blob = new Blob(
       [JSON.stringify(payload, null, 2)],
       { type: "application/json" }
     );
 
- const dataUrl = URL.createObjectURL(dataBlob);
-const dataLink = document.createElement("a");
-dataLink.href = dataUrl;
-dataLink.download = "meal-planner-data.json";
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "meal-planner-unified-export.json";
 
-document.body.appendChild(dataLink);
-dataLink.click();
-document.body.removeChild(dataLink);
-
-URL.revokeObjectURL(dataUrl);
-
-
-    /* ===============================
-       EXPORT ATTACHMENTS (LOCKED)
-    =============================== */
-
-    const db = await openAttachmentDB();
-
-    const attachments = [];
-await new Promise((resolve, reject) => {
-  const tx = db.transaction(ATTACHMENT_STORE, "readonly");
-  const store = tx.objectStore(ATTACHMENT_STORE);
-
-  const readers = [];
-
-  const req = store.openCursor();
-
-  req.onsuccess = e => {
-    const cursor = e.target.result;
-    if (!cursor) {
-      Promise.all(readers).then(resolve).catch(reject);
-      return;
-    }
-
-    readers.push(
-      new Promise(r => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          attachments.push({
-            id: cursor.key,
-            type: cursor.value.type,
-            data: reader.result
-          });
-          r();
-        };
-        reader.readAsDataURL(cursor.value);
-      })
-    );
-
-    cursor.continue();
-  };
-
-  req.onerror = () => reject(req.error);
-});
-
-  
-// Always export attachment file — even if empty
-if (attachments.length === 0) {
-  console.warn("No attachment blobs found. Exporting empty attachment file.");
-}
-
-// Create attachment file immediately after data export (mobile-safe)
-const attachBlob = new Blob(
-  [JSON.stringify({ attachments }, null, 2)],
-  { type: "application/json" }
-);
-
-const attachUrl = URL.createObjectURL(attachBlob);
-
-const attachLink = document.createElement("a");
-attachLink.href = attachUrl;
-attachLink.download = "meal-planner-attachments.json";
-
-document.body.appendChild(attachLink);
-attachLink.click();
-document.body.removeChild(attachLink);
-
-URL.revokeObjectURL(attachUrl);
-
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 }
+
+
 
     // ===== Recipe Attachment Upload (LOCKED) =====
 const addAttachmentBtn =
@@ -1965,47 +1949,16 @@ if (cleanupBrokenAttachmentsBtn) {
   };
 }
   
-    /* =========================================================
-   ONE-TIME BROKEN ATTACHMENT CLEANUP (AUTO)
+ /* =========================================================
+   BROKEN ATTACHMENT CLEANUP — DEV DISABLED
+   (Re-enabled after export/import is stable)
 ========================================================= */
 
-(async function removeBrokenAttachmentsOnce() {
-  const done = localStorage.getItem("mp_brokenAttachmentCleanupDone");
-  if (done) return;
+// NOTE:
+// Automatic attachment cleanup is DISABLED during development.
+// This prevents accidental data loss when testing across machines.
+// Manual cleanup button still works.
 
-  let removedCount = 0;
-
-  for (const meal of meals) {
-    if (!Array.isArray(meal.attachments)) continue;
-
-    const kept = [];
-
-    for (const att of meal.attachments) {
-      if (!att || !att.id) continue;
-
-      const blob = await getAttachmentBlob(att.id);
-      if (blob) {
-        kept.push(att);
-      } else {
-        removedCount++;
-      }
-    }
-
-    meal.attachments = kept;
-  }
-
-  if (removedCount > 0) {
-    saveAll();
-    console.log(
-      `Removed ${removedCount} broken attachment reference(s)`
-    );
-  }
-
-  localStorage.setItem(
-    "mp_brokenAttachmentCleanupDone",
-    "true"
-  );
-})();
  
 /* =========================================================
    ONE-TIME LEGACY MEAL MIGRATION (SAFE)
